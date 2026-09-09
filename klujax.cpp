@@ -1384,6 +1384,54 @@ struct KLUNumeric {
     ~KLUNumeric() { close(); }
 };
 
+template <typename T>
+struct Handle {
+    std::shared_ptr<T> resource;
+    explicit Handle(std::shared_ptr<T> resource) : resource(std::move(resource)) {}
+    std::shared_ptr<T> get() const { return std::atomic_load(&resource); }
+    void close() { std::atomic_store(&resource, std::shared_ptr<T>{}); }
+};
+
+struct HandleState {
+    static ffi::TypeId id;
+    std::shared_ptr<KLUSymbolic> symbolic;
+    std::shared_ptr<KLUNumeric> numeric;
+};
+
+ffi::TypeId HandleState::id = {};
+
+ffi::ErrorOr<std::unique_ptr<HandleState>> instantiate_handle(uint64_t address, bool symbolic) {
+    auto state = std::make_unique<HandleState>();
+    if (symbolic) {
+        state->symbolic = reinterpret_cast<Handle<KLUSymbolic>*>(address)->get();
+        if (!state->symbolic) return ffi::Unexpected(ffi::Error::InvalidArgument("KLU symbolic is closed"));
+    } else {
+        state->numeric = reinterpret_cast<Handle<KLUNumeric>*>(address)->get();
+        if (!state->numeric) return ffi::Unexpected(ffi::Error::InvalidArgument("KLU numeric is closed"));
+    }
+    return state;
+}
+
+ffi::Error read_handle(uint64_t, bool, HandleState* state,
+                       ffi::ResultBuffer<ffi::DataType::U64> output) {
+    if (state->symbolic) {
+        if (!state->symbolic->ptr) return ffi::Error::InvalidArgument("KLU symbolic is closed");
+        *output->typed_data() = state->symbolic->raw();
+    } else {
+        if (state->numeric->closed) return ffi::Error::InvalidArgument("KLU numeric is closed");
+        std::copy(state->numeric->ptrs.begin(), state->numeric->ptrs.end(), output->typed_data());
+    }
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    instantiate_handle_handler, instantiate_handle,
+    ffi::Ffi::BindInstantiate().Attr<uint64_t>("address").Attr<bool>("symbolic"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    read_handle_handler, read_handle,
+    ffi::Ffi::Bind().Attr<uint64_t>("address").Attr<bool>("symbolic").Ctx<ffi::State<HandleState>>().Ret<ffi::Buffer<ffi::DataType::U64>>());
+
 ffi::Error analyze(
     const ffi::Buffer<ffi::DataType::S32> Ai,
     const ffi::Buffer<ffi::DataType::S32> Aj,
@@ -1440,6 +1488,19 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 
 // Python wrappers
 PYBIND11_MODULE(klujax_cpp, m) {
+    m.def("owner_handle", []() {
+        py::dict handlers;
+        handlers["instantiate"] = py::capsule((void*)&instantiate_handle_handler);
+        handlers["execute"] = py::capsule((void*)&read_handle_handler);
+        return handlers;
+    });
+    m.def("owner_handle_type", []() {
+        static auto info = ffi::MakeTypeInfo<HandleState>();
+        py::dict registration;
+        registration["type_id"] = py::capsule((void*)&HandleState::id);
+        registration["type_info"] = py::capsule((void*)&info);
+        return registration;
+    });
     m.def("dot_f64",
           []() { return py::capsule((void*)&dot_f64_handler); });
     m.def("dot_c128",
@@ -1483,19 +1544,21 @@ PYBIND11_MODULE(klujax_cpp, m) {
     m.def("refactor_and_solve_c128",
           []() { return py::capsule((void*)&refactor_and_solve_c128_handler); });
 
-    py::class_<KLUSymbolic>(m, "KLUSymbolic")
-        .def(py::init<uint64_t>())
-        .def_property_readonly("raw", &KLUSymbolic::raw)
-        .def_property_readonly("handle", [](KLUSymbolic& s) -> KLUSymbolic& { return s; }, py::return_value_policy::reference)
-        .def("close", &KLUSymbolic::close)
-        .def("__enter__", [](KLUSymbolic& s) -> KLUSymbolic& { return s; }, py::return_value_policy::reference)
-        .def("__exit__", [](KLUSymbolic& s, py::args) { s.close(); });
+    py::class_<Handle<KLUSymbolic>>(m, "KLUSymbolic")
+        .def(py::init([](uint64_t raw) { return Handle<KLUSymbolic>(std::make_shared<KLUSymbolic>(raw)); }))
+        .def_property_readonly("raw", [](Handle<KLUSymbolic>& s) { auto p = s.get(); return p ? p->raw() : 0; })
+        .def_property_readonly("address", [](Handle<KLUSymbolic>& s) { return reinterpret_cast<uint64_t>(&s); })
+        .def_property_readonly("handle", [](Handle<KLUSymbolic>& s) -> Handle<KLUSymbolic>& { return s; }, py::return_value_policy::reference)
+        .def("close", &Handle<KLUSymbolic>::close)
+        .def("__enter__", [](Handle<KLUSymbolic>& s) -> Handle<KLUSymbolic>& { return s; }, py::return_value_policy::reference)
+        .def("__exit__", [](Handle<KLUSymbolic>& s, py::args) { s.close(); });
 
-    py::class_<KLUNumeric>(m, "KLUNumeric")
-        .def(py::init<std::vector<uint64_t>>())
-        .def_property_readonly("size", &KLUNumeric::size)
-        .def("as_list", &KLUNumeric::as_list)
-        .def("close", &KLUNumeric::close)
-        .def("__enter__", [](KLUNumeric& s) -> KLUNumeric& { return s; }, py::return_value_policy::reference)
-        .def("__exit__", [](KLUNumeric& s, py::args) { s.close(); });
+    py::class_<Handle<KLUNumeric>>(m, "KLUNumeric")
+        .def(py::init([](std::vector<uint64_t> raw) { return Handle<KLUNumeric>(std::make_shared<KLUNumeric>(std::move(raw))); }))
+        .def_property_readonly("size", [](Handle<KLUNumeric>& s) { auto p = s.get(); return p ? p->size() : 0; })
+        .def_property_readonly("address", [](Handle<KLUNumeric>& s) { return reinterpret_cast<uint64_t>(&s); })
+        .def("as_list", [](Handle<KLUNumeric>& s) { auto p = s.get(); return p ? p->as_list() : std::vector<uint64_t>{}; })
+        .def("close", &Handle<KLUNumeric>::close)
+        .def("__enter__", [](Handle<KLUNumeric>& s) -> Handle<KLUNumeric>& { return s; }, py::return_value_policy::reference)
+        .def("__exit__", [](Handle<KLUNumeric>& s, py::args) { s.close(); });
 }

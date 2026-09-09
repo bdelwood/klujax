@@ -59,7 +59,7 @@ suitesparse:
 xla:
     rm -rf xla
     git clone https://github.com/openxla/xla xla
-    cd xla && git checkout 05f004e8368c955b872126b1c978c60e33bbc5c8 && rm -rf .git
+    cd xla && git checkout a7e58876b73dfa9bb6bc785f6981a332c133bb55 && rm -rf .git
 
 # Clone pybind11
 pybind11:

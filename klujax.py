@@ -28,6 +28,7 @@ __all__ = [
 import os
 import sys
 import warnings
+from functools import cache
 from typing import Any
 
 import jax
@@ -192,15 +193,51 @@ def coalesce(
 # Handle helpers =====================================================================
 
 
+owner_handle = jax.extend.core.Primitive("klu_owner_handle")
+
+
+@owner_handle.def_impl
+def _owner_handle_impl(*, owner):
+    raw = owner.raw if isinstance(owner, KLUSymbolic) else owner.as_list()
+    return jnp.array(raw, dtype=jnp.uint64)
+
+
+@owner_handle.def_abstract_eval
+def _owner_handle_abstract(*, owner):
+    shape = () if isinstance(owner, KLUSymbolic) else (owner.size,)
+    return ShapedArray(shape, jnp.uint64)
+
+
+@cache
+def _register_owner_handle():
+    # CPU startup registers handlers before types; defer until it has finished.
+    jax.ffi.register_ffi_type("klu.HandleState", klujax_cpp.owner_handle_type())
+    jax.ffi.register_ffi_target(
+        "klu_owner_handle", klujax_cpp.owner_handle(), platform="cpu"
+    )
+
+
+def _owner_handle_lowering(ctx, *, owner):
+    _register_owner_handle()
+    # Python owns the factor until XLA instantiates its native shared owner.
+    ctx.module_context.add_keepalive(owner)
+    return jax.ffi.ffi_lowering("klu_owner_handle")(
+        ctx, address=np.uint64(owner.address), symbolic=isinstance(owner, KLUSymbolic)
+    )
+
+
+mlir.register_lowering(owner_handle, _owner_handle_lowering)
+
+
 def _get_symbolic_handle(symbolic: Any) -> Array:  # noqa: ANN401
     if isinstance(symbolic, klujax_cpp.KLUSymbolic):
-        return jnp.array(symbolic.raw, dtype=jnp.uint64)
+        return owner_handle.bind(owner=symbolic)
     return symbolic
 
 
 def _get_numeric_handle(numeric: Any) -> Array:  # noqa: ANN401
     if isinstance(numeric, klujax_cpp.KLUNumeric):
-        return jnp.array(numeric.as_list(), dtype=jnp.uint64)
+        return owner_handle.bind(owner=numeric)
     return numeric
 
 
@@ -292,8 +329,9 @@ def validate_numeric_solve(
 
 @jax.jit
 def _solve_with_symbol_jit(
-    Ai: Array, Aj: Array, Ax: Array, b: Array, sym_h: Array
+    Ai: Array, Aj: Array, Ax: Array, b: Array, symbolic: KLUSymbolic | Array
 ) -> Array:
+    sym_h = _get_symbolic_handle(symbolic)
     # Use the robust validator
     Ai, Aj, Ax, b, out_shape = validate_numeric_solve(Ai, Aj, Ax, b)
 
@@ -328,14 +366,14 @@ def solve_with_symbol(
         x: the result (x≈A^-1b)
 
     """
-    handle = _get_symbolic_handle(symbolic)
-    return _solve_with_symbol_jit(Ai, Aj, Ax, b, handle)
+    return _solve_with_symbol_jit(Ai, Aj, Ax, b, symbolic)
 
 
 @jax.jit
 def _tsolve_with_symbol_jit(
-    Ai: Array, Aj: Array, Ax: Array, b: Array, sym_h: Array
+    Ai: Array, Aj: Array, Ax: Array, b: Array, symbolic: KLUSymbolic | Array
 ) -> Array:
+    sym_h = _get_symbolic_handle(symbolic)
     Ai, Aj, Ax, b, out_shape = validate_numeric_solve(Ai, Aj, Ax, b)
 
     is_complex = any(x.dtype in COMPLEX_DTYPES for x in (Ax, b))
@@ -375,12 +413,14 @@ def tsolve_with_symbol(
         x: the result (x≈(A^T)^-1 b)
 
     """
-    handle = _get_symbolic_handle(symbolic)
-    return _tsolve_with_symbol_jit(Ai, Aj, Ax, b, handle)
+    return _tsolve_with_symbol_jit(Ai, Aj, Ax, b, symbolic)
 
 
 @jax.jit
-def _factor_jit(Ai: Array, Aj: Array, Ax: Array, sym_h: Array) -> Array:
+def _factor_jit(
+    Ai: Array, Aj: Array, Ax: Array, symbolic: KLUSymbolic | Array
+) -> Array:
+    sym_h = _get_symbolic_handle(symbolic)
     dummy_b = jnp.zeros((1,), dtype=Ax.dtype)
     Ai, Aj, Ax, _, _ = validate_args(Ai, Aj, Ax, dummy_b)
     prim = factor_c128 if Ax.dtype in COMPLEX_DTYPES else factor_f64
@@ -403,15 +443,21 @@ def factor(
             Inside vmap, returns a raw array — RAII cannot wrap traced values.
 
     """
-    sym_h = _get_symbolic_handle(symbolic)
-    raw_numeric = _factor_jit(Ai, Aj, Ax, sym_h)
+    raw_numeric = _factor_jit(Ai, Aj, Ax, symbolic)
     if isinstance(raw_numeric, jax.core.Tracer):
         return raw_numeric
     return klujax_cpp.KLUNumeric(list(np.asarray(raw_numeric).flat))
 
 
 @jax.jit
-def _refactor_jit(Ai: Array, Aj: Array, Ax: Array, sym_h: Array, num_h: Array) -> Array:
+def _refactor_jit(
+    Ai: Array,
+    Aj: Array,
+    Ax: Array,
+    symbolic: KLUSymbolic | Array,
+    numeric: KLUNumeric | Array,
+) -> Array:
+    sym_h, num_h = _get_symbolic_handle(symbolic), _get_numeric_handle(numeric)
     dummy_b = jnp.zeros((1,), dtype=Ax.dtype)
     Ai, Aj, Ax, _, _ = validate_args(Ai, Aj, Ax, dummy_b)
     prim = refactor_c128 if Ax.dtype in COMPLEX_DTYPES else refactor_f64
@@ -442,14 +488,15 @@ def refactor(
         numeric: the same handle, updated in-place
 
     """
-    num_h = _get_numeric_handle(numeric)
-    sym_h = _get_symbolic_handle(symbolic)
-    _refactor_jit(Ai, Aj, Ax, sym_h, num_h)
+    _refactor_jit(Ai, Aj, Ax, symbolic, numeric)
     return numeric
 
 
 @jax.jit
-def _solve_with_numeric_jit(num_h: Array, b: Array, sym_h: Array) -> Array:
+def _solve_with_numeric_jit(
+    numeric: KLUNumeric | Array, b: Array, symbolic: KLUSymbolic | Array
+) -> Array:
+    sym_h, num_h = _get_symbolic_handle(symbolic), _get_numeric_handle(numeric)
     prim = (
         solve_with_numeric_c128 if b.dtype in COMPLEX_DTYPES else solve_with_numeric_f64
     )
@@ -472,13 +519,14 @@ def solve_with_numeric(
         x: the result (x≈A^-1b)
 
     """
-    num_h = _get_numeric_handle(numeric)
-    sym_h = _get_symbolic_handle(symbolic)
-    return _solve_with_numeric_jit(num_h, b, sym_h)
+    return _solve_with_numeric_jit(numeric, b, symbolic)
 
 
 @jax.jit
-def _tsolve_with_numeric_jit(num_h: Array, b: Array, sym_h: Array) -> Array:
+def _tsolve_with_numeric_jit(
+    numeric: KLUNumeric | Array, b: Array, symbolic: KLUSymbolic | Array
+) -> Array:
+    sym_h, num_h = _get_symbolic_handle(symbolic), _get_numeric_handle(numeric)
     prim = (
         tsolve_with_numeric_c128
         if b.dtype in COMPLEX_DTYPES
@@ -508,15 +556,19 @@ def tsolve_with_numeric(
         x: the result (x≈(A^T)^-1 b)
 
     """
-    num_h = _get_numeric_handle(numeric)
-    sym_h = _get_symbolic_handle(symbolic)
-    return _tsolve_with_numeric_jit(num_h, b, sym_h)
+    return _tsolve_with_numeric_jit(numeric, b, symbolic)
 
 
 @jax.jit
 def _refactor_and_solve_jit(
-    Ai: Array, Aj: Array, Ax: Array, b: Array, sym_h: Array, num_h: Array
+    Ai: Array,
+    Aj: Array,
+    Ax: Array,
+    b: Array,
+    symbolic: KLUSymbolic | Array,
+    numeric: KLUNumeric | Array,
 ) -> tuple[Array, Array]:
+    sym_h, num_h = _get_symbolic_handle(symbolic), _get_numeric_handle(numeric)
     # Use validate_numeric_solve to standardize shapes and get the expected out_shape
     Ai, Aj, Ax, b, out_shape = validate_numeric_solve(Ai, Aj, Ax, b)
 
@@ -565,9 +617,7 @@ def refactor_and_solve(
         (x, numeric): solution array and the same numeric handle
 
     """
-    num_h = _get_numeric_handle(numeric)
-    sym_h = _get_symbolic_handle(symbolic)
-    x, _ = _refactor_and_solve_jit(Ai, Aj, Ax, b, sym_h, num_h)
+    x, _ = _refactor_and_solve_jit(Ai, Aj, Ax, b, symbolic, numeric)
     return x, numeric
 
 

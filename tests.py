@@ -229,6 +229,22 @@ def test_solve_with_numeric(dtype):
     x = jsp.linalg.solve(A, b)
     _log_and_test_equality(x, x_sp)
 
+    compiled = (
+        jax.jit(
+            lambda rhs, num=numeric, sym=symbolic: klujax.solve_with_numeric(
+                num, rhs, sym
+            )
+        )
+        .lower(b)
+        .compile()
+    )
+    symbolic.close()
+    numeric.close()
+    del symbolic, numeric
+    jax.clear_caches()
+    gc.collect()
+    _log_and_test_equality(x, compiled(b))
+
 
 @log_test_name
 @parametrize_dtypes
@@ -730,3 +746,53 @@ def test_no_leak_numeric():
     assert rss_after - rss_before < 10_000, (
         f"RSS grew by {rss_after - rss_before} KB after 5000 factor() calls"
     )
+
+
+@parametrize_dtypes
+def test_temporary_numeric_gradient(dtype):
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, 5, dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 5)
+
+    def loss(values):
+        num = klujax.factor(Ai, Aj, lax.stop_gradient(values), sym)
+        matrix = jnp.zeros((5, 5), dtype=dtype).at[Ai, Aj].add(values)
+        x = lax.custom_linear_solve(
+            lambda x: matrix @ x,
+            b,
+            solve=lambda _, rhs: klujax.solve_with_numeric(num, rhs, sym),
+            transpose_solve=lambda _, rhs: klujax.tsolve_with_numeric(num, rhs, sym),
+        )
+        return jnp.real(jnp.vdot(x, x))
+
+    def reference(values):
+        matrix = jnp.zeros((5, 5), dtype=dtype).at[Ai, Aj].add(values)
+        x = jnp.linalg.solve(matrix, b)
+        return jnp.real(jnp.vdot(x, x))
+
+    np.testing.assert_allclose(
+        jax.grad(loss)(Ax), jax.grad(reference)(Ax), rtol=1e-9, atol=1e-9
+    )
+
+
+def test_queued_numeric_lifetime():
+    Ai = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
+    Aj = jnp.array([0, 1, 0, 1], dtype=jnp.int32)
+    matrix = jnp.array([[4.0, 1.0], [2.0, 3.0]])
+    sym = klujax.analyze(Ai, Aj, 2)
+    num = klujax.factor(Ai, Aj, matrix.ravel(), sym)
+    assert isinstance(num, klujax.KLUNumeric)
+    b = jnp.tile(jnp.array([1.0, 2.0]), 5000)
+
+    def delayed_solve(num, sym, rhs):
+        # Keep native CPU work queued while Python releases the executable.
+        rhs = lax.fori_loop(0, 20_000, lambda _, x: jnp.sin(x) + 0.001, rhs)[:2]
+        return klujax.solve_with_numeric(num, rhs, sym), rhs
+
+    compiled = jax.jit(delayed_solve).lower(num, sym, b).compile()
+    x, rhs = compiled(num, sym, b)
+    num.close()
+    sym.close()
+    del compiled, delayed_solve, sym, num
+    jax.clear_caches()
+    gc.collect()
+    np.testing.assert_allclose(matrix @ x, rhs, rtol=1e-12)

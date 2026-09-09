@@ -138,6 +138,12 @@ for i in range(100):
 
 ### Lifecycle & Pointer Pitfalls
 
+Compiled solves retain eagerly created factors until their executable and pending
+execution release them. `close()` releases the Python handle's ownership; already
+compiled solves remain valid. Compilation caches can therefore retain factors,
+and each new owner specializes the compiled solve. Allocation inside `jit` is
+not covered by this ownership guarantee.
+
 Because `klujax.analyze` and `klujax.factor` generate `KLUHandleManager` objects which wrap low level C++ pointers, there are strict rules for avoiding memory leaks and segmentation faults.
 
 #### The "Ghost Pointer" Problem inside JIT:
